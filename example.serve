@@ -1,0 +1,7 @@
+# Simple static file server
+title = Local files
+description = Serves a static folder over HTTP
+root = .
+server = python-http
+exposure = local
+port = 8765
