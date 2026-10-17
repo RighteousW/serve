@@ -1,0 +1,10 @@
+[Unit]
+Description=Serve application on port %i
+After=network.target
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/serve --run %i
+KillMode=control-group
+Restart=no
+TimeoutStopSec=10s

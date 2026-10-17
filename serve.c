@@ -8,22 +8,22 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-typedef struct {
-    char title[128];
-    char description[512];
-    char root[1024];
-    char server[32];
-    char exposure[16];
-    unsigned port;
-} ServeConfig;
+#include "serve.h"
+#include "manager.h"
 
 static void help(const char *program)
 {
     printf("Usage:\n"
-           "  %s --discover [directory]\n"
-           "  %s <file.serve>\n"
-           "  %s --help\n", program, program, program);
+           "  %s <file.serve>          Start a managed server\n"
+           "  %s --discover [directory] Find .serve files\n"
+           "  %s --list                List registered servers\n"
+           "  %s --status <port>       Show service metadata and state\n"
+           "  %s --pause <port>        Suspend processes; keep sockets bound\n"
+           "  %s --restart <port>      Resume a paused server\n"
+           "  %s --stop <port>         Stop server and release its port\n"
+           "  %s --help                Show this guide\n",
+           program, program, program, program, program, program,
+           program, program);
 }
 
 static int discover(const char *path)
@@ -69,7 +69,7 @@ static int copy_value(char *dst, size_t cap, const char *value)
     return 0;
 }
 
-static int parse(const char *filename, ServeConfig *cfg)
+int parse_serve(const char *filename, ServeConfig *cfg)
 {
     static const char *keys[] = {
         "title", "description", "root", "server", "exposure", "port"
@@ -147,10 +147,10 @@ static int parse(const char *filename, ServeConfig *cfg)
     return 0;
 }
 
-static int serve(const char *filename)
+int run_serve(const char *filename)
 {
     ServeConfig cfg;
-    if (parse(filename, &cfg)) return 1;
+    if (parse_serve(filename, &cfg)) return 1;
 
     char *absolute = realpath(filename, NULL);
     if (!absolute) { perror(filename); return 1; }
@@ -205,9 +205,19 @@ int main(int argc, char **argv)
         }
         return discover(argc == 3 ? argv[2] : ".");
     }
+    if (argc == 2 && strcmp(argv[1], "--list") == 0)
+        return manager_list();
+    if (argc == 3) {
+        if (strcmp(argv[1], "--run") == 0) return manager_run(argv[2]);
+        if (strcmp(argv[1], "--status") == 0) return manager_status(argv[2]);
+        if (strcmp(argv[1], "--stop") == 0) return manager_stop(argv[2]);
+        if (strcmp(argv[1], "--pause") == 0) return manager_pause(argv[2]);
+        if (strcmp(argv[1], "--restart") == 0) return manager_restart(argv[2]);
+    }
     if (argc == 2 && argv[1][0] != '-') {
         const char *ext = strrchr(argv[1], '.');
-        if (ext && strcmp(ext, ".serve") == 0) return serve(argv[1]);
+        if (ext && strcmp(ext, ".serve") == 0)
+            return manager_start(argv[1]);
     }
     fprintf(stderr, "Invalid arguments.\n");
     help(argv[0]);
