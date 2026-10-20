@@ -72,7 +72,8 @@ static int copy_value(char *dst, size_t cap, const char *value)
 int parse_serve(const char *filename, ServeConfig *cfg)
 {
     static const char *keys[] = {
-        "title", "description", "root", "server", "exposure", "port"
+        "title", "description", "root", "server",
+        "exposure", "port", "command"
     };
     unsigned seen = 0;
     memset(cfg, 0, sizeof *cfg);
@@ -95,7 +96,7 @@ int parse_serve(const char *filename, ServeConfig *cfg)
         char *key = trim(s);
         char *value = trim(equal + 1);
         int index = -1;
-        for (int i = 0; i < 6; i++) {
+        for (int i = 0; i < 7; i++) {
             if (strcmp(key, keys[i]) == 0) { index = i; break; }
         }
         if (index < 0 || (seen & (1u << index)) || !*value) {
@@ -117,6 +118,13 @@ int parse_serve(const char *filename, ServeConfig *cfg)
                 else cfg->port = (unsigned)n;
                 break;
             }
+            case 6:
+                error = copy_value(
+                    cfg->command,
+                    sizeof cfg->command,
+                    value
+                );
+                break;
         }
         if (error) break;
     }
@@ -127,13 +135,27 @@ int parse_serve(const char *filename, ServeConfig *cfg)
         fprintf(stderr, "Invalid .serve file at line %u\n", lineno);
         return 1;
     }
-    if (seen != (1u << 6) - 1u) {
+    if ((seen & ((1u << 6) - 1u)) != ((1u << 6) - 1u)) {
         fprintf(stderr, "Missing required field(s) in %s\n", filename);
         return 1;
     }
+
+    if (strcmp(cfg->server, "command") == 0) {
+        if (!(seen & (1u << 6))) {
+            fprintf(stderr,
+                    "server=command requires a command field\n");
+            return 1;
+        }
+    } else if (seen & (1u << 6)) {
+        fprintf(stderr,
+                "command field requires server=command\n");
+        return 1;
+    }
+
     if (strcmp(cfg->server, "npm-dev") &&
         strcmp(cfg->server, "npm-preview") &&
-        strcmp(cfg->server, "python-http")) {
+        strcmp(cfg->server, "python-http") &&
+        strcmp(cfg->server, "command")) {
         fprintf(stderr, "Unsupported server: %s\n", cfg->server);
         return 1;
     }
@@ -176,7 +198,15 @@ int run_serve(const char *filename)
     printf("Serving %s (%s) on %s:%s\n", cfg.title, cfg.description, host, port);
     fflush(stdout);
 
-    if (strcmp(cfg.server, "python-http") == 0) {
+    if (strcmp(cfg.server, "command") == 0) {
+        if (setenv("SERVE_HOST", host, 1) != 0 ||
+            setenv("SERVE_PORT", port, 1) != 0) {
+            perror("setenv");
+            return 1;
+        }
+
+        execl("/bin/sh", "sh", "-c", cfg.command, (char *)NULL);
+    } else if (strcmp(cfg.server, "python-http") == 0) {
         char *const args[] = {"python3", "-m", "http.server", port,
                               "--bind", (char *)host, NULL};
         execvp(args[0], args);
