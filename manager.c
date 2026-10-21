@@ -1,8 +1,13 @@
+#define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 700
 #include "manager.h"
 #include "serve.h"
 #include <dirent.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -18,6 +23,43 @@
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
+
+/* Display locally configured IPv4 destinations, not a connectivity guarantee.
+ * Non-local exposures bind 0.0.0.0, so enumerate active local interfaces.
+ * Public/WAN addresses behind NAT cannot be inferred from local interfaces. */
+static void print_addresses(const ServeConfig *cfg)
+{
+    printf("127.0.0.1:%u", cfg->port);
+    if (strcmp(cfg->exposure, "local") == 0) return;
+
+    struct ifaddrs *interfaces = NULL;
+    if (getifaddrs(&interfaces) != 0) {
+        printf(" (could not enumerate IPv4 interfaces)");
+        return;
+    }
+    char printed[64][INET_ADDRSTRLEN];
+    size_t count = 0;
+    for (const struct ifaddrs *it = interfaces; it; it = it->ifa_next) {
+        if (!it->ifa_addr || it->ifa_addr->sa_family != AF_INET ||
+            !(it->ifa_flags & IFF_UP) || (it->ifa_flags & IFF_LOOPBACK))
+            continue;
+
+        const struct sockaddr_in *addr = (const struct sockaddr_in *)it->ifa_addr;
+        char ip[INET_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof ip) ||
+            strcmp(ip, "0.0.0.0") == 0 || strncmp(ip, "127.", 4) == 0)
+            continue;
+
+        size_t j = 0;
+        for (; j < count; j++)
+            if (strcmp(ip, printed[j]) == 0) break;
+        if (j < count) continue;
+        printf(", %s:%u", ip, cfg->port);
+        if (count < sizeof printed / sizeof printed[0])
+            strcpy(printed[count++], ip);
+    }
+    freeifaddrs(interfaces);
+}
 
 static int port_number(const char *text, unsigned *port)
 {
@@ -248,6 +290,9 @@ int manager_start(const char *filename)
         return 1;
     }
     printf("Registered serve@%u.service\n", cfg.port);
+    printf("Addresses:    ");
+    print_addresses(&cfg);
+    putchar('\n');
     return 0;
 }
 
@@ -291,6 +336,9 @@ static int show_status(unsigned port)
         printf("Server:       %s\n", cfg.server);
         printf("Exposure:     %s\n", cfg.exposure);
         printf("Port:         %u\n", cfg.port);
+        printf("Addresses:    ");
+        print_addresses(&cfg);
+        putchar('\n');
         if (cfg.port != port)
             fprintf(stderr, "Warning: configuration port differs from registered port\n");
     } else {
@@ -319,7 +367,7 @@ int manager_list(void)
         perror(dirpath);
         return 1;
     }
-    printf("%-7s %-10s %s\n", "PORT", "STATE", "TITLE");
+    printf("%-7s %-10s %-28s %s\n", "PORT", "STATE", "TITLE", "ADDRESSES (IPv4)");
     struct dirent *entry;
     int found = 0;
     while ((entry = readdir(dir)) != NULL) {
@@ -335,8 +383,12 @@ int manager_list(void)
         char file[PATH_MAX];
         if (registered_path(port, file, sizeof file)) continue;
         ServeConfig cfg;
-        const char *title = parse_serve(file, &cfg) ? "(config missing/invalid)" : cfg.title;
-        printf("%-7u %-10s %s\n", port, service_state(port), title);
+        int valid = parse_serve(file, &cfg) == 0;
+        const char *title = valid ? cfg.title : "(config missing/invalid)";
+        printf("%-7u %-10s %-28s ", port, service_state(port), title);
+        if (valid) print_addresses(&cfg);
+        else putchar('-');
+        putchar('\n');
         found++;
     }
     if (closedir(dir) != 0) return 1;
