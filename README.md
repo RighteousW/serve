@@ -1,6 +1,16 @@
 # serve
 
-A small POSIX C CLI for serving `.serve` projects as **systemd user services**, one instance per port. Requires Linux with `systemd --user` and `python3` or `npm` for the selected server.
+**serve** is a lightweight POSIX C command-line tool for registering and managing locally hosted projects as Linux `systemd --user` services, with one managed instance per port. Each project is described by a simple `.serve` file that identifies what to run, where to run it, and which port and network binding to use.
+
+## Goal
+
+The aim is to make it easier to run several development servers, internal tools, and workers without leaving terminal sessions open or writing a separate systemd unit for each project. Serve discovers configuration files and provides one CLI for starting, listing, inspecting, pausing, resuming, and stopping services; **systemd remains responsible for process supervision**.
+
+Serve is intended for Linux systems with systemd user services, not as a replacement for a web server, reverse proxy, firewall, or container platform. The built-in server modes require `python3` or `npm` as applicable.
+
+## Related tools
+
+For more complete lifecycle and restart management, consider [systemd and systemd-run](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html), [PM2](https://pm2.io/docs/runtime/overview/), or [Supervisor](https://supervisord.org/). Serve's narrower focus is a small, per-project configuration format and a convenient CLI on top of systemd, rather than a new process supervisor.
 
 ## Install
 
