@@ -9,6 +9,7 @@ typedef struct {
     char command[2048];
     char exposure[16];
     unsigned port;
+    int persist_boot, persist_port, auto_start_on_boot; /* -1 inherits global */
 } ServeConfig;
 
 int parse_serve(const char *filename, ServeConfig *cfg);

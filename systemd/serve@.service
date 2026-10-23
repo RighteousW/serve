@@ -8,3 +8,6 @@ ExecStart=%h/.local/bin/serve --run %i
 KillMode=control-group
 Restart=no
 TimeoutStopSec=10s
+
+[Install]
+WantedBy=default.target

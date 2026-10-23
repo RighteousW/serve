@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include "serve.h"
 #include "manager.h"
+#include "policy.h"
 
 static void help(const char *program)
 {
@@ -19,11 +20,13 @@ static void help(const char *program)
            "  %s --list                List registered servers\n"
            "  %s --status <port>       Show service metadata and state\n"
            "  %s --pause <port>        Suspend processes; keep sockets bound\n"
-           "  %s --restart <port>      Resume a paused server\n"
+           "  %s --restart <port>      Resume or start inactive server\n"
            "  %s --stop <port>         Stop server and release its port\n"
+           "  %s --config [key bool]   Show/set defaults\n"
+           "  %s --sync                Apply policies to registrations\n"
            "  %s --help                Show this guide\n",
            program, program, program, program, program, program,
-           program, program);
+           program, program, program, program);
 }
 
 static int discover(const char *path)
@@ -73,10 +76,12 @@ int parse_serve(const char *filename, ServeConfig *cfg)
 {
     static const char *keys[] = {
         "title", "description", "root", "server",
-        "exposure", "port", "command"
+        "exposure", "port", "command",
+        "persist_boot", "persist_port", "auto_start_on_boot"
     };
     unsigned seen = 0;
     memset(cfg, 0, sizeof *cfg);
+    cfg->persist_boot = cfg->persist_port = cfg->auto_start_on_boot = -1;
     FILE *file = fopen(filename, "r");
     if (!file) { perror(filename); return 1; }
 
@@ -96,7 +101,7 @@ int parse_serve(const char *filename, ServeConfig *cfg)
         char *key = trim(s);
         char *value = trim(equal + 1);
         int index = -1;
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < 10; i++) {
             if (strcmp(key, keys[i]) == 0) { index = i; break; }
         }
         if (index < 0 || (seen & (1u << index)) || !*value) {
@@ -116,6 +121,16 @@ int parse_serve(const char *filename, ServeConfig *cfg)
                 long n = strtol(value, &end, 10);
                 if (errno || *end || n < 1 || n > 65535) error = 1;
                 else cfg->port = (unsigned)n;
+                break;
+            }
+            case 7: case 8: case 9: {
+                int v;
+                if (!strcmp(value, "true")) v = 1;
+                else if (!strcmp(value, "false")) v = 0;
+                else { error = 1; break; }
+                if (index == 7) cfg->persist_boot = v;
+                else if (index == 8) cfg->persist_port = v;
+                else cfg->auto_start_on_boot = v;
                 break;
             }
             case 6:
@@ -235,6 +250,16 @@ int main(int argc, char **argv)
         }
         return discover(argc == 3 ? argv[2] : ".");
     }
+    if (argc >= 2 && strcmp(argv[1], "--config") == 0) {
+        if (argc != 2 && argc != 4) {
+            fprintf(stderr, "Usage: serve --config [key true|false]\n");
+            return 1;
+        }
+        int result = policy_config(argc - 2, (const char *const *)(argv + 2));
+        if (!result && argc == 4) return manager_sync();
+        return result;
+    }
+    if (argc == 2 && strcmp(argv[1], "--sync") == 0) return manager_sync();
     if (argc == 2 && strcmp(argv[1], "--list") == 0)
         return manager_list();
     if (argc == 3) {

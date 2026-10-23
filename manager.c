@@ -3,6 +3,7 @@
 #define _XOPEN_SOURCE 700
 #include "manager.h"
 #include "serve.h"
+#include "policy.h"
 #include <dirent.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -268,6 +269,40 @@ static const char *service_state(unsigned port)
     return "inactive";
 }
 
+static int apply_unit_policy(unsigned port, const ServeConfig *cfg)
+{
+    ServePolicy policy;
+    if (policy_effective(cfg, &policy)) return 1;
+    const char *action = (policy.persist_boot || policy.auto_start_on_boot)
+                         ? "enable" : "disable";
+    if (unit_command(port, action, 0, NULL, 0)) {
+        fprintf(stderr, "Could not %s serve@%u.service\n", action, port);
+        return 1;
+    }
+    if (policy.auto_start_on_boot)
+        fprintf(stderr, "Machine boot startup requires user lingering. Use: sudo loginctl enable-linger \"$USER\"\n");
+    return 0;
+}
+
+static int replace_nonpersistent_registration(unsigned port)
+{
+    char path[PATH_MAX], filename[PATH_MAX];
+    if (state_path(path, sizeof path, port, "path")) return 1;
+    if (access(path, F_OK) != 0) return 0;
+    if (registered_path(port, filename, sizeof filename)) return 1;
+    ServeConfig existing;
+    ServePolicy policy;
+    if (parse_serve(filename, &existing) || policy_effective(&existing, &policy)) return 1;
+    if (policy.persist_port || !unit_command(port, "is-active", 1, NULL, 0)) {
+        fprintf(stderr, "Port %u is already reserved by serve\n", port);
+        return 1;
+    }
+    if (unit_command(port, "disable", 1, NULL, 0)) return 1;
+    if (unlink(path)) { perror("unlink registration"); return 1; }
+    remove_marker(port);
+    return 0;
+}
+
 int manager_start(const char *filename)
 {
     ServeConfig cfg;
@@ -279,9 +314,15 @@ int manager_start(const char *filename)
         free(absolute);
         return 1;
     }
+    if (replace_nonpersistent_registration(cfg.port)) { free(absolute); return 1; }
     int result = write_registration(cfg.port, absolute);
     free(absolute);
     if (result) return 1;
+    if (apply_unit_policy(cfg.port, &cfg)) {
+        char path[PATH_MAX];
+        if (!state_path(path, sizeof path, cfg.port, "path")) unlink(path);
+        return 1;
+    }
     printf("Starting %s on port %u ...\n", cfg.title, cfg.port);
     fflush(stdout);
     if (unit_command(cfg.port, "start", 0, NULL, 0)) {
@@ -310,6 +351,7 @@ int manager_run(const char *port_text)
         fprintf(stderr, "Registered configuration does not match port %u\n", port);
         return 1;
     }
+    remove_marker(port);
     return run_serve(file);
 }
 
@@ -336,6 +378,12 @@ static int show_status(unsigned port)
         printf("Server:       %s\n", cfg.server);
         printf("Exposure:     %s\n", cfg.exposure);
         printf("Port:         %u\n", cfg.port);
+        ServePolicy policy;
+        if (!policy_effective(&cfg, &policy)) {
+            printf("Persist boot: %s\n", policy.persist_boot ? "true" : "false");
+            printf("Persist port: %s (logical reservation)\n", policy.persist_port ? "true" : "false");
+            printf("Autostart:    %s\n", policy.auto_start_on_boot ? "true" : "false");
+        }
         printf("Addresses:    ");
         print_addresses(&cfg);
         putchar('\n');
@@ -426,13 +474,30 @@ int manager_restart(const char *port_text)
 {
     unsigned port;
     if (port_number(port_text, &port) || require_registered(port)) return 1;
-    if (!paused(port) || unit_command(port, "is-active", 1, NULL, 0)) {
-        fprintf(stderr, "Port %u is not a running, paused service\n", port);
+    if (!unit_command(port, "is-active", 1, NULL, 0)) {
+        if (!paused(port)) {
+            fprintf(stderr, "Port %u is already running\n", port);
+            return 1;
+        }
+        if (unit_command(port, "resume", 0, NULL, 0)) return 1;
+        remove_marker(port);
+        printf("Resumed port %u\n", port);
+        return 0;
+    }
+    remove_marker(port);
+    char filename[PATH_MAX];
+    ServeConfig cfg;
+    if (registered_path(port, filename, sizeof filename) ||
+        parse_serve(filename, &cfg) || cfg.port != port) {
+        fprintf(stderr, "Invalid registered configuration for port %u\n", port);
         return 1;
     }
-    if (unit_command(port, "resume", 0, NULL, 0)) return 1;
-    remove_marker(port);
-    printf("Resumed port %u\n", port);
+    (void)unit_command(port, "reset-failed", 1, NULL, 0);
+    if (apply_unit_policy(port, &cfg) || unit_command(port, "start", 0, NULL, 0)) {
+        fprintf(stderr, "Could not start serve@%u.service; inspect journalctl --user -u serve@%u.service\n", port, port);
+        return 1;
+    }
+    printf("Started inactive port %u\n", port);
     return 0;
 }
 
@@ -442,6 +507,7 @@ int manager_stop(const char *port_text)
     if (port_number(port_text, &port) || require_registered(port)) return 1;
     if (paused(port)) (void)unit_command(port, "resume", 0, NULL, 0);
     if (unit_command(port, "stop", 0, NULL, 0)) return 1;
+    if (unit_command(port, "disable", 0, NULL, 0)) return 1;
     (void)unit_command(port, "reset-failed", 1, NULL, 0);
     remove_marker(port);
     char path[PATH_MAX];
@@ -451,4 +517,39 @@ int manager_stop(const char *port_text)
     }
     printf("Stopped port %u and removed its registration\n", port);
     return 0;
+}
+
+int manager_sync(void)
+{
+    char folder[PATH_MAX];
+    if (state_dir(folder, sizeof folder)) return 1;
+    DIR *dir = opendir(folder);
+    if (!dir) {
+        if (errno == ENOENT) return 0;
+        perror(folder);
+        return 1;
+    }
+    int error = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        const char *dot = strrchr(entry->d_name, '.');
+        if (!dot || strcmp(dot, ".path")) continue;
+        char port_text[16];
+        size_t n = (size_t)(dot - entry->d_name);
+        if (!n || n >= sizeof port_text) continue;
+        memcpy(port_text, entry->d_name, n);
+        port_text[n] = '\0';
+        unsigned port;
+        if (port_number(port_text, &port)) continue;
+        char filename[PATH_MAX];
+        ServeConfig cfg;
+        if (registered_path(port, filename, sizeof filename) ||
+            parse_serve(filename, &cfg) || cfg.port != port ||
+            apply_unit_policy(port, &cfg)) {
+            fprintf(stderr, "Failed to sync registered port %u\n", port);
+            error = 1;
+        }
+    }
+    if (closedir(dir)) error = 1;
+    return error;
 }
