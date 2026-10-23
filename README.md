@@ -67,3 +67,17 @@ Security note: `.serve` files can launch npm scripts. Only register trusted conf
 `persist_port` is only a logical reservation in Serve's registry after shutdown/reboot: a stopped process cannot hold its TCP socket. `persist_boot` enables the systemd user service at user-manager startup. `auto_start_on_boot` also enables the user unit; true machine boot startup requires `sudo loginctl enable-linger "$USER"`. The two flags overlap once lingering is enabled. Setting global flags updates existing registered unit enablement but does not immediately start inactive units.
 
 Upgrade: `git pull && make clean && make && make install-user && serve --sync`. Restore now with `serve --restart 8082` etc. Services are not automatically restarted if they crash; this feature addresses reboot recovery and explicit restart only.
+
+
+## Bulk operations
+
+Use `--all` wherever a lifecycle or status command accepts a port:
+
+```sh
+serve --status --all
+serve --pause --all
+serve --restart --all
+serve --stop --all
+```
+
+Bulk operations use a snapshot of registered services in ascending port order and continue after individual errors. `--restart --all` resumes paused services, starts inactive/failed services, and skips services that are already running. `--pause --all` skips services that aren't running. A nonzero exit code means at least one operation failed. **`--stop --all` unregisters every service and disables its autostart**, just like calling `--stop PORT` on each port; you must re-register services afterward to start them again.

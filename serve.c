@@ -18,10 +18,10 @@ static void help(const char *program)
            "  %s <file.serve>          Start a managed server\n"
            "  %s --discover [directory] Find .serve files\n"
            "  %s --list                List registered servers\n"
-           "  %s --status <port>       Show service metadata and state\n"
-           "  %s --pause <port>        Suspend processes; keep sockets bound\n"
-           "  %s --restart <port>      Resume or start inactive server\n"
-           "  %s --stop <port>         Stop server and release its port\n"
+           "  %s --status <port|--all>       Show service metadata and state\n"
+           "  %s --pause <port|--all>        Suspend processes; keep sockets bound\n"
+           "  %s --restart <port|--all>      Resume or start inactive server\n"
+           "  %s --stop <port|--all>         Stop server and release its port\n"
            "  %s --config [key bool]   Show/set defaults\n"
            "  %s --sync                Apply policies to registrations\n"
            "  %s --help                Show this guide\n",
@@ -262,6 +262,8 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--sync") == 0) return manager_sync();
     if (argc == 2 && strcmp(argv[1], "--list") == 0)
         return manager_list();
+    if (argc == 3 && strcmp(argv[2], "--all") == 0)
+        return manager_all(argv[1]);
     if (argc == 3) {
         if (strcmp(argv[1], "--run") == 0) return manager_run(argv[2]);
         if (strcmp(argv[1], "--status") == 0) return manager_status(argv[2]);

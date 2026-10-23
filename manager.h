@@ -2,6 +2,7 @@
 #define MANAGER_H
 
 int manager_sync(void);
+int manager_all(const char *action);
 int manager_start(const char *filename);
 int manager_run(const char *port);
 int manager_list(void);

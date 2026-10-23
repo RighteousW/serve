@@ -553,3 +553,77 @@ int manager_sync(void)
     if (closedir(dir)) error = 1;
     return error;
 }
+
+/* Snapshot the registrations before acting: --stop --all removes .path files. */
+int manager_all(const char *action)
+{
+    int (*operation)(const char *) = NULL;
+    if (strcmp(action, "--status") == 0) operation = manager_status;
+    else if (strcmp(action, "--stop") == 0) operation = manager_stop;
+    else if (strcmp(action, "--pause") == 0) operation = manager_pause;
+    else if (strcmp(action, "--restart") == 0) operation = manager_restart;
+    else {
+        fprintf(stderr, "--all is supported with --status, --stop, --pause and --restart\n");
+        return 1;
+    }
+
+    char folder[PATH_MAX];
+    if (state_dir(folder, sizeof folder)) return 1;
+    DIR *dir = opendir(folder);
+    if (!dir) {
+        if (errno == ENOENT) {
+            puts("No registered services.");
+            return 0;
+        }
+        perror(folder);
+        return 1;
+    }
+
+    /* Port numbers are bounded at 65535; this also sorts and deduplicates. */
+    unsigned char registered[65536] = {0};
+    struct dirent *entry;
+    int error = 0;
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) {
+            if (errno) { perror("readdir"); error = 1; }
+            break;
+        }
+        const char *suffix = strrchr(entry->d_name, '.');
+        if (!suffix || strcmp(suffix, ".path") != 0) continue;
+        size_t n = (size_t)(suffix - entry->d_name);
+        if (n == 0 || n > 5) continue;
+        char number[6];
+        memcpy(number, entry->d_name, n);
+        number[n] = '\0';
+        unsigned port;
+        if (!port_number(number, &port)) registered[port] = 1;
+    }
+    if (closedir(dir)) { perror("closedir"); error = 1; }
+    if (error) return 1;
+
+    unsigned processed = 0, skipped = 0, failed = 0;
+    for (unsigned port = 1; port <= 65535; port++) {
+        if (!registered[port]) continue;
+        processed++;
+        if (operation == manager_pause && strcmp(service_state(port), "running") != 0) {
+            printf("Port %u is not running (skipped)\n", port);
+            skipped++;
+            continue;
+        }
+        if (operation == manager_restart && strcmp(service_state(port), "running") == 0) {
+            printf("Port %u is already running (skipped)\n", port);
+            skipped++;
+            continue;
+        }
+        char number[6];
+        snprintf(number, sizeof number, "%u", port);
+        if (operation == manager_status) printf("\n--- Port %u ---\n", port);
+        if (operation(number)) failed++;
+    }
+    if (!processed) puts("No registered services.");
+    else printf("\nProcessed %u registered service(s): %u succeeded, %u skipped, %u failed.\n",
+                processed, processed - skipped - failed, skipped, failed);
+    return failed != 0;
+}
