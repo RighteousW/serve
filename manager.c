@@ -491,7 +491,7 @@ int manager_list(void)
         perror(dirpath);
         return 1;
     }
-    printf("%-7s %-10s %-20s %-28s %s\n", "PORT", "STATE", "SHORT TITLE", "TITLE / ADDRESSES (IPv4)");
+    printf("%-7s %-10s %-20s %-28s %s\n", "PORT", "STATE", "SHORT TITLE", "TITLE", "ADDRESSES (IPv4)");
     struct dirent *entry;
     int found = 0;
     while ((entry = readdir(dir)) != NULL) {
