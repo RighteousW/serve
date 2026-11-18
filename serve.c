@@ -11,22 +11,24 @@
 #include "serve.h"
 #include "manager.h"
 #include "policy.h"
+#include "history.h"
 
 static void help(const char *program)
 {
     printf("Usage:\n"
-           "  %s <file.serve>          Start a managed server\n"
-           "  %s --discover [directory] Find .serve files\n"
-           "  %s --list                List registered servers\n"
-           "  %s --status <port|--all>       Show service metadata and state\n"
-           "  %s --pause <port|--all>        Suspend processes; keep sockets bound\n"
-           "  %s --restart <port|--all>      Resume or start inactive server\n"
-           "  %s --stop <port|--all>         Stop server and release its port\n"
-           "  %s --config [key bool]   Show/set defaults\n"
-           "  %s --sync                Apply policies to registrations\n"
-           "  %s --help                Show this guide\n",
+           "  %s <file.serve>                Register and start a service\n"
+           "  %s --discover [directory]      Find .serve files\n"
+           "  %s --list                      List registered services\n"
+           "  %s --status <targets...|--all> Inspect one or more services\n"
+           "  %s --pause <targets...|--all>  Suspend processes (sockets stay bound)\n"
+           "  %s --restart <targets...|--all> Stop and freshly start services\n"
+           "  %s --stop <targets...|--all>   Stop and unregister services\n"
+           "  %s --history                   Show recorded lifecycle events\n"
+           "  %s --config [key bool]         Show/set defaults\n"
+           "  %s --sync                      Apply policies to registrations\n"
+           "  %s --help                      Show this guide\n",
            program, program, program, program, program, program,
-           program, program, program, program);
+           program, program, program, program, program);
 }
 
 static int discover(const char *path)
@@ -72,12 +74,25 @@ static int copy_value(char *dst, size_t cap, const char *value)
     return 0;
 }
 
+static int valid_short_title(const char *value)
+{
+    size_t n = strlen(value);
+    if (!n || n >= 32 || value[0] < 'a' || value[0] > 'z') return 0;
+    for (size_t i = 1; i < n; ++i) {
+        char c = value[i];
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) continue;
+        if (c != '-' || i + 1 == n) return 0;
+    }
+    return 1;
+}
+
 int parse_serve(const char *filename, ServeConfig *cfg)
 {
     static const char *keys[] = {
         "title", "description", "root", "server",
         "exposure", "port", "command",
-        "persist_boot", "persist_port", "auto_start_on_boot"
+        "persist_boot", "persist_port", "auto_start_on_boot",
+        "short_title"
     };
     unsigned seen = 0;
     memset(cfg, 0, sizeof *cfg);
@@ -101,7 +116,7 @@ int parse_serve(const char *filename, ServeConfig *cfg)
         char *key = trim(s);
         char *value = trim(equal + 1);
         int index = -1;
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 11; i++) {
             if (strcmp(key, keys[i]) == 0) { index = i; break; }
         }
         if (index < 0 || (seen & (1u << index)) || !*value) {
@@ -111,6 +126,10 @@ int parse_serve(const char *filename, ServeConfig *cfg)
         seen |= 1u << index;
         switch (index) {
             case 0: error = copy_value(cfg->title, sizeof cfg->title, value); break;
+            case 10:
+                error = copy_value(cfg->short_title, sizeof cfg->short_title, value);
+                if (!error && !valid_short_title(cfg->short_title)) error = 1;
+                break;
             case 1: error = copy_value(cfg->description, sizeof cfg->description, value); break;
             case 2: error = copy_value(cfg->root, sizeof cfg->root, value); break;
             case 3: error = copy_value(cfg->server, sizeof cfg->server, value); break;
@@ -260,17 +279,14 @@ int main(int argc, char **argv)
         return result;
     }
     if (argc == 2 && strcmp(argv[1], "--sync") == 0) return manager_sync();
-    if (argc == 2 && strcmp(argv[1], "--list") == 0)
-        return manager_list();
-    if (argc == 3 && strcmp(argv[2], "--all") == 0)
-        return manager_all(argv[1]);
-    if (argc == 3) {
-        if (strcmp(argv[1], "--run") == 0) return manager_run(argv[2]);
-        if (strcmp(argv[1], "--status") == 0) return manager_status(argv[2]);
-        if (strcmp(argv[1], "--stop") == 0) return manager_stop(argv[2]);
-        if (strcmp(argv[1], "--pause") == 0) return manager_pause(argv[2]);
-        if (strcmp(argv[1], "--restart") == 0) return manager_restart(argv[2]);
-    }
+    if (argc == 2 && strcmp(argv[1], "--history") == 0) return history_show();
+    if (argc == 2 && strcmp(argv[1], "--list") == 0) return manager_list();
+    if (argc == 3 && strcmp(argv[1], "--run") == 0) return manager_run(argv[2]);
+    if (argc >= 3 && (strcmp(argv[1], "--status") == 0 ||
+                      strcmp(argv[1], "--stop") == 0 ||
+                      strcmp(argv[1], "--pause") == 0 ||
+                      strcmp(argv[1], "--restart") == 0))
+        return manager_targets(argv[1], argc - 2, (const char *const *)(argv + 2));
     if (argc == 2 && argv[1][0] != '-') {
         const char *ext = strrchr(argv[1], '.');
         if (ext && strcmp(ext, ".serve") == 0)

@@ -3,6 +3,7 @@
 
 typedef struct {
     char title[128];
+    char short_title[32];
     char description[512];
     char root[1024];
     char server[32];

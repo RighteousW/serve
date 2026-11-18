@@ -4,8 +4,8 @@ PREFIX ?= $(HOME)/.local
 
 all: serve
 
-serve: serve.c manager.c policy.c serve.h manager.h policy.h
-	$(CC) $(CFLAGS) serve.c manager.c policy.c -o $@
+serve: serve.c manager.c policy.c history.c serve.h manager.h policy.h history.h
+	$(CC) $(CFLAGS) serve.c manager.c policy.c history.c -o $@
 
 install-user: serve
 	install -Dm755 serve "$(PREFIX)/bin/serve"
