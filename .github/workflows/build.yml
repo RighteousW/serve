@@ -1,0 +1,30 @@
+name: Build and smoke test
+on:
+  push:
+    branches: [main, feature/short-titles-multi-history]
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile with warnings as errors
+        run: make clean && make CFLAGS='-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror'
+      - name: Check CLI and parser
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./serve --help | grep -- '--history'
+          ./serve --history | grep -E 'No history recorded|WHEN'
+          ./serve --list
+          ./serve --status --all
+          ./serve --restart --all
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          cp example.serve "$tmp/good.serve"
+          sed 's/short_title = files/short_title = Bad Name/' example.serve > "$tmp/bad.serve"
+          if ./serve "$tmp/bad.serve" >"$tmp/output" 2>&1; then
+            echo 'Invalid short title was accepted' >&2
+            exit 1
+          fi
+          grep 'Invalid .serve file' "$tmp/output"
