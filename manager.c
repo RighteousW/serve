@@ -4,7 +4,6 @@
 #include "manager.h"
 #include "serve.h"
 #include "policy.h"
-#include "history.h"
 #include <dirent.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -146,77 +145,6 @@ static int registered_path(unsigned port, char *dest, size_t size)
     }
     if (fclose(file) != 0) okay = 0;
     return okay ? 0 : 1;
-}
-
-
-/* Collect a stable set of registered ports before any lifecycle changes. */
-static int collect_registered(unsigned char registered[65536])
-{
-    memset(registered, 0, 65536);
-    char folder[PATH_MAX];
-    if (state_dir(folder, sizeof folder)) return 1;
-    DIR *dir = opendir(folder);
-    if (!dir) {
-        if (errno == ENOENT) return 0;
-        perror(folder);
-        return 1;
-    }
-    int error = 0;
-    struct dirent *entry;
-    for (;;) {
-        errno = 0;
-        entry = readdir(dir);
-        if (!entry) {
-            if (errno) { perror("readdir"); error = 1; }
-            break;
-        }
-        const char *suffix = strrchr(entry->d_name, '.');
-        if (!suffix || strcmp(suffix, ".path") != 0) continue;
-        size_t n = (size_t)(suffix - entry->d_name);
-        if (!n || n > 5) continue;
-        char number[6];
-        memcpy(number, entry->d_name, n);
-        number[n] = '\0';
-        unsigned port;
-        if (!port_number(number, &port)) registered[port] = 1;
-    }
-    if (closedir(dir)) { perror("closedir"); error = 1; }
-    return error;
-}
-
-/* A short title is optional, but a supplied one must be unique at registration. */
-static int validate_unique_short_title(const ServeConfig *cfg, unsigned self_port)
-{
-    if (!cfg->short_title[0]) return 0;
-    unsigned char registered[65536];
-    if (collect_registered(registered)) return 1;
-    for (unsigned port = 1; port <= 65535; port++) {
-        if (!registered[port] || port == self_port) continue;
-        char path[PATH_MAX];
-        ServeConfig existing;
-        if (registered_path(port, path, sizeof path)) {
-            fprintf(stderr, "Cannot verify short titles: unreadable registration %u\n", port);
-            return 1;
-        }
-        if (parse_serve(path, &existing)) {
-            fprintf(stderr, "Cannot verify short titles: invalid configuration for %u\n", port);
-            return 1;
-        }
-        if (strcmp(cfg->short_title, existing.short_title) == 0) {
-            fprintf(stderr, "Short title '%s' is already registered on port %u\n",
-                    cfg->short_title, port);
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static int log_activity(unsigned port, const ServeConfig *cfg,
-                        const char *activity, int failed)
-{
-    return history_record(port, cfg ? cfg->short_title : NULL,
-                          cfg ? cfg->title : "(unavailable)",
-                          activity, failed ? "failed" : "ok");
 }
 
 static int write_registration(unsigned port, const char *file)
@@ -375,46 +303,38 @@ static int replace_nonpersistent_registration(unsigned port)
     return 0;
 }
 
-static int start_internal(const char *filename, int record)
+int manager_start(const char *filename)
 {
     ServeConfig cfg;
     if (parse_serve(filename, &cfg)) return 1;
-    int failed = 1;
     char *absolute = realpath(filename, NULL);
-    if (!absolute) { perror(filename); goto done; }
+    if (!absolute) { perror(filename); return 1; }
     if (strchr(absolute, '\n') || strchr(absolute, '\r')) {
-        fputs("Configuration path cannot contain a newline\n", stderr);
-        goto done;
+        fprintf(stderr, "Configuration path cannot contain a newline\n");
+        free(absolute);
+        return 1;
     }
-    if (validate_unique_short_title(&cfg, cfg.port)) goto done;
-    if (replace_nonpersistent_registration(cfg.port)) goto done;
-    if (write_registration(cfg.port, absolute)) goto done;
+    if (replace_nonpersistent_registration(cfg.port)) { free(absolute); return 1; }
+    int result = write_registration(cfg.port, absolute);
+    free(absolute);
+    if (result) return 1;
     if (apply_unit_policy(cfg.port, &cfg)) {
         char path[PATH_MAX];
         if (!state_path(path, sizeof path, cfg.port, "path")) unlink(path);
-        goto done;
+        return 1;
     }
     printf("Starting %s on port %u ...\n", cfg.title, cfg.port);
     fflush(stdout);
     if (unit_command(cfg.port, "start", 0, NULL, 0)) {
         fprintf(stderr, "Could not start serve@%u.service. Try --status %u or journalctl --user -u serve@%u.service\n",
                 cfg.port, cfg.port, cfg.port);
-        goto done;
+        return 1;
     }
     printf("Registered serve@%u.service\n", cfg.port);
     printf("Addresses:    ");
     print_addresses(&cfg);
     putchar('\n');
-    failed = 0;
-done:
-    free(absolute);
-    if (record && log_activity(cfg.port, &cfg, "start", failed)) failed = 1;
-    return failed;
-}
-
-int manager_start(const char *filename)
-{
-    return start_internal(filename, 1);
+    return 0;
 }
 
 int manager_run(const char *port_text)
@@ -453,7 +373,6 @@ static int show_status(unsigned port)
     printf("Configuration:%s\n", filename);
     if (valid) {
         printf("Title:        %s\n", cfg.title);
-        printf("Short title:  %s\n", cfg.short_title[0] ? cfg.short_title : "(none)");
         printf("Description:  %s\n", cfg.description);
         printf("Root:         %s (relative to config)\n", cfg.root);
         printf("Server:       %s\n", cfg.server);
@@ -496,7 +415,7 @@ int manager_list(void)
         perror(dirpath);
         return 1;
     }
-    printf("%-7s %-10s %-20s %-28s %s\n", "PORT", "STATE", "SHORT TITLE", "TITLE / ADDRESSES (IPv4)");
+    printf("%-7s %-10s %-28s %s\n", "PORT", "STATE", "TITLE", "ADDRESSES (IPv4)");
     struct dirent *entry;
     int found = 0;
     while ((entry = readdir(dir)) != NULL) {
@@ -514,8 +433,7 @@ int manager_list(void)
         ServeConfig cfg;
         int valid = parse_serve(file, &cfg) == 0;
         const char *title = valid ? cfg.title : "(config missing/invalid)";
-        printf("%-7u %-10s %-20s %-28s ", port, service_state(port),
-               valid && cfg.short_title[0] ? cfg.short_title : "-", title);
+        printf("%-7u %-10s %-28s ", port, service_state(port), title);
         if (valid) print_addresses(&cfg);
         else putchar('-');
         putchar('\n');
@@ -534,39 +452,63 @@ static int require_registered(unsigned port)
     return 1;
 }
 
-int manager_pause(const char *port_text)
+
+static int pause_port(unsigned port)
 {
-    unsigned port;
-    if (port_number(port_text, &port) || require_registered(port)) return 1;
-    if (paused(port)) { fprintf(stderr, "Port %u is already paused\n", port); return 1; }
-    if (unit_command(port, "is-active", 1, NULL, 0)) {
+    if (require_registered(port)) return 1;
+    char filename[PATH_MAX];
+    ServeConfig cfg;
+    int valid = !registered_path(port, filename, sizeof filename) &&
+                !parse_serve(filename, &cfg);
+    int failed = 1;
+    if (paused(port)) {
+        fprintf(stderr, "Port %u is already paused\n", port);
+    } else if (unit_command(port, "is-active", 1, NULL, 0)) {
         fprintf(stderr, "Port %u is not running\n", port);
-        return 1;
-    }
-    if (unit_command(port, "pause", 0, NULL, 0)) return 1;
-    if (pause_marker(port)) {
+    } else if (unit_command(port, "pause", 0, NULL, 0)) {
+        fprintf(stderr, "Could not pause port %u\n", port);
+    } else if (pause_marker(port)) {
         (void)unit_command(port, "resume", 0, NULL, 0);
-        return 1;
+    } else {
+        printf("Paused port %u (existing listening sockets remain bound)\n", port);
+        failed = 0;
     }
-    printf("Paused port %u (existing listening sockets remain bound)\n", port);
-    return 0;
+    if (log_activity(port, valid ? &cfg : NULL, "pause", failed)) failed = 1;
+    return failed;
 }
 
-int manager_restart(const char *port_text)
+/* Stop and unregister. Used by --stop and by a full --restart. */
+static int stop_port(unsigned port, int record)
 {
-    unsigned port;
-    if (port_number(port_text, &port) || require_registered(port)) return 1;
-    if (!unit_command(port, "is-active", 1, NULL, 0)) {
-        if (!paused(port)) {
-            fprintf(stderr, "Port %u is already running\n", port);
-            return 1;
-        }
-        if (unit_command(port, "resume", 0, NULL, 0)) return 1;
-        remove_marker(port);
-        printf("Resumed port %u\n", port);
-        return 0;
+    if (require_registered(port)) return 1;
+    char filename[PATH_MAX];
+    ServeConfig cfg;
+    int valid = !registered_path(port, filename, sizeof filename) &&
+                !parse_serve(filename, &cfg);
+    int failed = 1;
+    if (paused(port) && unit_command(port, "resume", 0, NULL, 0)) {
+        fprintf(stderr, "Could not resume paused port %u before stopping\n", port);
+        goto done;
     }
+    if (unit_command(port, "stop", 0, NULL, 0)) goto done;
+    if (unit_command(port, "disable", 0, NULL, 0)) goto done;
+    (void)unit_command(port, "reset-failed", 1, NULL, 0);
     remove_marker(port);
+    char path[PATH_MAX];
+    if (state_path(path, sizeof path, port, "path") || unlink(path)) {
+        perror("Remove registration");
+        goto done;
+    }
+    printf("Stopped port %u and removed its registration\n", port);
+    failed = 0;
+done:
+    if (record && log_activity(port, valid ? &cfg : NULL, "stop", failed)) failed = 1;
+    return failed;
+}
+
+static int restart_port(unsigned port)
+{
+    if (require_registered(port)) return 1;
     char filename[PATH_MAX];
     ServeConfig cfg;
     if (registered_path(port, filename, sizeof filename) ||
@@ -574,31 +516,36 @@ int manager_restart(const char *port_text)
         fprintf(stderr, "Invalid registered configuration for port %u\n", port);
         return 1;
     }
-    (void)unit_command(port, "reset-failed", 1, NULL, 0);
-    if (apply_unit_policy(port, &cfg) || unit_command(port, "start", 0, NULL, 0)) {
-        fprintf(stderr, "Could not start serve@%u.service; inspect journalctl --user -u serve@%u.service\n", port, port);
-        return 1;
-    }
-    printf("Started inactive port %u\n", port);
-    return 0;
+    int failed = 1;
+    /* Keep a copy: stop_port removes the registration, not the source .serve file. */
+    if (stop_port(port, 0)) goto done;
+    if (start_internal(filename, 0)) goto done;
+    printf("Restarted port %u from its .serve configuration\n", port);
+    failed = 0;
+done:
+    if (log_activity(port, &cfg, "restart", failed)) failed = 1;
+    return failed;
+}
+
+int manager_pause(const char *port_text)
+{
+    unsigned port;
+    if (port_number(port_text, &port)) return 1;
+    return pause_port(port);
+}
+
+int manager_restart(const char *port_text)
+{
+    unsigned port;
+    if (port_number(port_text, &port)) return 1;
+    return restart_port(port);
 }
 
 int manager_stop(const char *port_text)
 {
     unsigned port;
-    if (port_number(port_text, &port) || require_registered(port)) return 1;
-    if (paused(port)) (void)unit_command(port, "resume", 0, NULL, 0);
-    if (unit_command(port, "stop", 0, NULL, 0)) return 1;
-    if (unit_command(port, "disable", 0, NULL, 0)) return 1;
-    (void)unit_command(port, "reset-failed", 1, NULL, 0);
-    remove_marker(port);
-    char path[PATH_MAX];
-    if (state_path(path, sizeof path, port, "path") || unlink(path)) {
-        perror("Remove registration");
-        return 1;
-    }
-    printf("Stopped port %u and removed its registration\n", port);
-    return 0;
+    if (port_number(port_text, &port)) return 1;
+    return stop_port(port, 1);
 }
 
 int manager_sync(void)
@@ -636,76 +583,91 @@ int manager_sync(void)
     return error;
 }
 
-/* Snapshot the registrations before acting: --stop --all removes .path files. */
-int manager_all(const char *action)
+
+/* Resolve a complete target set before changing any service. */
+static int resolve_target(const char *target,
+                          const unsigned char registered[65536], unsigned *port_out)
+{
+    unsigned port;
+    if (!port_number(target, &port)) {
+        if (!registered[port]) {
+            fprintf(stderr, "Port %u is not registered\n", port);
+            return 1;
+        }
+        *port_out = port;
+        return 0;
+    }
+    /* Invalid numeric-looking strings are never interpreted as aliases. */
+    if (!target[0] || (target[0] >= '0' && target[0] <= '9') || target[0] == '-') {
+        fprintf(stderr, "Invalid service target: %s\n", target);
+        return 1;
+    }
+    unsigned found = 0;
+    for (port = 1; port <= 65535; port++) {
+        if (!registered[port]) continue;
+        char filename[PATH_MAX];
+        ServeConfig cfg;
+        if (registered_path(port, filename, sizeof filename) ||
+            parse_serve(filename, &cfg)) {
+            fprintf(stderr, "Unable to resolve short title: invalid registration %u\n", port);
+            return 1;
+        }
+        if (strcmp(cfg.short_title, target) != 0) continue;
+        if (found) {
+            fprintf(stderr, "Ambiguous short title: %s\n", target);
+            return 1;
+        }
+        found = port;
+    }
+    if (!found) {
+        fprintf(stderr, "Unknown service short title: %s\n", target);
+        return 1;
+    }
+    *port_out = found;
+    return 0;
+}
+
+int manager_targets(const char *action, int count, const char *const *targets)
 {
     int (*operation)(const char *) = NULL;
     if (strcmp(action, "--status") == 0) operation = manager_status;
     else if (strcmp(action, "--stop") == 0) operation = manager_stop;
     else if (strcmp(action, "--pause") == 0) operation = manager_pause;
     else if (strcmp(action, "--restart") == 0) operation = manager_restart;
-    else {
-        fprintf(stderr, "--all is supported with --status, --stop, --pause and --restart\n");
-        return 1;
-    }
+    else return 1;
 
-    char folder[PATH_MAX];
-    if (state_dir(folder, sizeof folder)) return 1;
-    DIR *dir = opendir(folder);
-    if (!dir) {
-        if (errno == ENOENT) {
-            puts("No registered services.");
-            return 0;
+    unsigned char registered[65536], selected[65536] = {0};
+    if (collect_registered(registered)) return 1;
+    if (count == 1 && strcmp(targets[0], "--all") == 0) {
+        memcpy(selected, registered, sizeof selected);
+    } else {
+        for (int i = 0; i < count; i++) {
+            if (strcmp(targets[i], "--all") == 0) {
+                fputs("--all cannot be combined with other targets\n", stderr);
+                return 1;
+            }
+            unsigned port;
+            if (resolve_target(targets[i], registered, &port)) return 1;
+            if (selected[port]) {
+                fprintf(stderr, "Duplicate target for port %u\n", port);
+                return 1;
+            }
+            selected[port] = 1;
         }
-        perror(folder);
-        return 1;
     }
 
-    /* Port numbers are bounded at 65535; this also sorts and deduplicates. */
-    unsigned char registered[65536] = {0};
-    struct dirent *entry;
-    int error = 0;
-    for (;;) {
-        errno = 0;
-        entry = readdir(dir);
-        if (!entry) {
-            if (errno) { perror("readdir"); error = 1; }
-            break;
-        }
-        const char *suffix = strrchr(entry->d_name, '.');
-        if (!suffix || strcmp(suffix, ".path") != 0) continue;
-        size_t n = (size_t)(suffix - entry->d_name);
-        if (n == 0 || n > 5) continue;
-        char number[6];
-        memcpy(number, entry->d_name, n);
-        number[n] = '\0';
-        unsigned port;
-        if (!port_number(number, &port)) registered[port] = 1;
-    }
-    if (closedir(dir)) { perror("closedir"); error = 1; }
-    if (error) return 1;
-
-    unsigned processed = 0, skipped = 0, failed = 0;
+    unsigned processed = 0, failed = 0;
     for (unsigned port = 1; port <= 65535; port++) {
-        if (!registered[port]) continue;
+        if (!selected[port]) continue;
         processed++;
-        if (operation == manager_pause && strcmp(service_state(port), "running") != 0) {
-            printf("Port %u is not running (skipped)\n", port);
-            skipped++;
-            continue;
-        }
-        if (operation == manager_restart && strcmp(service_state(port), "running") == 0) {
-            printf("Port %u is already running (skipped)\n", port);
-            skipped++;
-            continue;
-        }
         char number[6];
         snprintf(number, sizeof number, "%u", port);
         if (operation == manager_status) printf("\n--- Port %u ---\n", port);
         if (operation(number)) failed++;
     }
     if (!processed) puts("No registered services.");
-    else printf("\nProcessed %u registered service(s): %u succeeded, %u skipped, %u failed.\n",
-                processed, processed - skipped - failed, skipped, failed);
+    else if (count > 1 || strcmp(targets[0], "--all") == 0)
+        printf("\nProcessed %u service(s): %u succeeded, %u failed.\n",
+               processed, processed - failed, failed);
     return failed != 0;
 }
