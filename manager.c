@@ -4,6 +4,7 @@
 #include "manager.h"
 #include "serve.h"
 #include "policy.h"
+#include "history.h"
 #include <dirent.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -145,6 +146,77 @@ static int registered_path(unsigned port, char *dest, size_t size)
     }
     if (fclose(file) != 0) okay = 0;
     return okay ? 0 : 1;
+}
+
+
+/* Collect a stable set of registered ports before any lifecycle changes. */
+static int collect_registered(unsigned char registered[65536])
+{
+    memset(registered, 0, 65536);
+    char folder[PATH_MAX];
+    if (state_dir(folder, sizeof folder)) return 1;
+    DIR *dir = opendir(folder);
+    if (!dir) {
+        if (errno == ENOENT) return 0;
+        perror(folder);
+        return 1;
+    }
+    int error = 0;
+    struct dirent *entry;
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) {
+            if (errno) { perror("readdir"); error = 1; }
+            break;
+        }
+        const char *suffix = strrchr(entry->d_name, '.');
+        if (!suffix || strcmp(suffix, ".path") != 0) continue;
+        size_t n = (size_t)(suffix - entry->d_name);
+        if (!n || n > 5) continue;
+        char number[6];
+        memcpy(number, entry->d_name, n);
+        number[n] = '\0';
+        unsigned port;
+        if (!port_number(number, &port)) registered[port] = 1;
+    }
+    if (closedir(dir)) { perror("closedir"); error = 1; }
+    return error;
+}
+
+/* A short title is optional, but a supplied one must be unique at registration. */
+static int validate_unique_short_title(const ServeConfig *cfg, unsigned self_port)
+{
+    if (!cfg->short_title[0]) return 0;
+    unsigned char registered[65536];
+    if (collect_registered(registered)) return 1;
+    for (unsigned port = 1; port <= 65535; port++) {
+        if (!registered[port] || port == self_port) continue;
+        char path[PATH_MAX];
+        ServeConfig existing;
+        if (registered_path(port, path, sizeof path)) {
+            fprintf(stderr, "Cannot verify short titles: unreadable registration %u\n", port);
+            return 1;
+        }
+        if (parse_serve(path, &existing)) {
+            fprintf(stderr, "Cannot verify short titles: invalid configuration for %u\n", port);
+            return 1;
+        }
+        if (strcmp(cfg->short_title, existing.short_title) == 0) {
+            fprintf(stderr, "Short title '%s' is already registered on port %u\n",
+                    cfg->short_title, port);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int log_activity(unsigned port, const ServeConfig *cfg,
+                        const char *activity, int failed)
+{
+    return history_record(port, cfg ? cfg->short_title : NULL,
+                          cfg ? cfg->title : "(unavailable)",
+                          activity, failed ? "failed" : "ok");
 }
 
 static int write_registration(unsigned port, const char *file)
@@ -303,38 +375,46 @@ static int replace_nonpersistent_registration(unsigned port)
     return 0;
 }
 
-int manager_start(const char *filename)
+static int start_internal(const char *filename, int record)
 {
     ServeConfig cfg;
     if (parse_serve(filename, &cfg)) return 1;
+    int failed = 1;
     char *absolute = realpath(filename, NULL);
-    if (!absolute) { perror(filename); return 1; }
+    if (!absolute) { perror(filename); goto done; }
     if (strchr(absolute, '\n') || strchr(absolute, '\r')) {
-        fprintf(stderr, "Configuration path cannot contain a newline\n");
-        free(absolute);
-        return 1;
+        fputs("Configuration path cannot contain a newline\n", stderr);
+        goto done;
     }
-    if (replace_nonpersistent_registration(cfg.port)) { free(absolute); return 1; }
-    int result = write_registration(cfg.port, absolute);
-    free(absolute);
-    if (result) return 1;
+    if (validate_unique_short_title(&cfg, cfg.port)) goto done;
+    if (replace_nonpersistent_registration(cfg.port)) goto done;
+    if (write_registration(cfg.port, absolute)) goto done;
     if (apply_unit_policy(cfg.port, &cfg)) {
         char path[PATH_MAX];
         if (!state_path(path, sizeof path, cfg.port, "path")) unlink(path);
-        return 1;
+        goto done;
     }
     printf("Starting %s on port %u ...\n", cfg.title, cfg.port);
     fflush(stdout);
     if (unit_command(cfg.port, "start", 0, NULL, 0)) {
         fprintf(stderr, "Could not start serve@%u.service. Try --status %u or journalctl --user -u serve@%u.service\n",
                 cfg.port, cfg.port, cfg.port);
-        return 1;
+        goto done;
     }
     printf("Registered serve@%u.service\n", cfg.port);
     printf("Addresses:    ");
     print_addresses(&cfg);
     putchar('\n');
-    return 0;
+    failed = 0;
+done:
+    free(absolute);
+    if (record && log_activity(cfg.port, &cfg, "start", failed)) failed = 1;
+    return failed;
+}
+
+int manager_start(const char *filename)
+{
+    return start_internal(filename, 1);
 }
 
 int manager_run(const char *port_text)
@@ -373,6 +453,7 @@ static int show_status(unsigned port)
     printf("Configuration:%s\n", filename);
     if (valid) {
         printf("Title:        %s\n", cfg.title);
+        printf("Short title:  %s\n", cfg.short_title[0] ? cfg.short_title : "(none)");
         printf("Description:  %s\n", cfg.description);
         printf("Root:         %s (relative to config)\n", cfg.root);
         printf("Server:       %s\n", cfg.server);
@@ -415,7 +496,7 @@ int manager_list(void)
         perror(dirpath);
         return 1;
     }
-    printf("%-7s %-10s %-28s %s\n", "PORT", "STATE", "TITLE", "ADDRESSES (IPv4)");
+    printf("%-7s %-10s %-20s %-28s %s\n", "PORT", "STATE", "SHORT TITLE", "TITLE / ADDRESSES (IPv4)");
     struct dirent *entry;
     int found = 0;
     while ((entry = readdir(dir)) != NULL) {
@@ -433,7 +514,8 @@ int manager_list(void)
         ServeConfig cfg;
         int valid = parse_serve(file, &cfg) == 0;
         const char *title = valid ? cfg.title : "(config missing/invalid)";
-        printf("%-7u %-10s %-28s ", port, service_state(port), title);
+        printf("%-7u %-10s %-20s %-28s ", port, service_state(port),
+               valid && cfg.short_title[0] ? cfg.short_title : "-", title);
         if (valid) print_addresses(&cfg);
         else putchar('-');
         putchar('\n');
