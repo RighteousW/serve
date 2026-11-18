@@ -80,4 +80,30 @@ serve --restart --all
 serve --stop --all
 ```
 
-Bulk operations use a snapshot of registered services in ascending port order and continue after individual errors. `--restart --all` resumes paused services, starts inactive/failed services, and skips services that are already running. `--pause --all` skips services that aren't running. A nonzero exit code means at least one operation failed. **`--stop --all` unregisters every service and disables its autostart**, just like calling `--stop PORT` on each port; you must re-register services afterward to start them again.
+Bulk operations use a snapshot of registered services in ascending port order and continue after individual errors. `--restart --all` performs a fresh stop-and-start cycle for every registered service, including running services. A nonzero exit code means at least one operation failed. **`--stop --all` unregisters every service and disables its autostart**, just like calling `--stop PORT` on each port; you must re-register services afterward to start them again.
+
+## Short titles, multiple targets and history
+
+A service may declare an optional unique short title:
+
+```ini
+title = Novel Archive
+short_title = novel
+```
+
+Short titles must be 1–31 characters, start with a lowercase ASCII letter and contain only lowercase ASCII letters, digits and hyphens (no trailing hyphen). The title is validated on parsing and checked for uniqueness against all registered services before registration. Existing configurations without `short_title` continue to work by port.
+
+```sh
+serve --status novel
+serve --restart novel 8765 4321
+serve --pause 3434 3455 2334 2239
+serve --stop novel 8765
+serve --restart --all
+serve --history
+```
+
+Multiple targets are validated as a group before any changes. Repeated targets and mixing `--all` with individual targets are rejected. Actions run in ascending port order, continue after individual failures and return a nonzero status if any action fails.
+
+**Restart always performs a full stop/unregister followed by registration/start from the same configuration file.** This applies to running, paused, failed and inactive services. The stop is completed before the start; if the new start fails, the service may remain stopped or registered but inactive, so inspect the error and re-register its `.serve` file if necessary.
+
+`--history` shows timestamp, port, short title, title, activity and result for starts, pauses, restarts and stops. History is persisted in `$XDG_STATE_HOME/serve/history.tsv` (default `~/.local/state/serve/history.tsv`). It records commands executed through `serve`, not external systemd actions or events before this feature was installed.
